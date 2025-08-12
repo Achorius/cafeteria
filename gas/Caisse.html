@@ -1,0 +1,297 @@
+<!-- Caisse.html (cartes abo, fond de caisse, menu spontané, limite 45) -->
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <title>Caisse — CAFÉTÉRIA CO FLORENCE</title>
+  <style>
+    html { font-size: calc(15px + (22 - 15) * ((100vw - 320px) / (1920 - 320))); }
+    body { margin:0; padding:0; font-family:sans-serif; background:#fff; color:#111; }
+
+    header {
+      position: sticky; top: 0; z-index: 10;
+      display:flex; align-items:center; justify-content:space-between;
+      gap:.75rem; padding:.75rem 1.25rem; background:#f7f7f7; border-bottom:1px solid #e5e5e5;
+    }
+    header h1 { margin:0; font-size: 1.35em; }
+
+    /* Buttons (smaller) */
+    .btn { border:0; border-radius:12px; padding:.5rem .75rem; cursor:pointer; font-size:.95rem; }
+    .btn.sm { padding:.35rem .6rem; font-size:.9rem; border-radius:10px; }
+    .primary { background:#007bff; color:#fff; }
+    .secondary { background:#e0e0e0; }
+    .danger { background:#dc3545; color:#fff; }
+
+    .actions { display:flex; gap:.5rem; align-items:center; flex-wrap: wrap; }
+
+    /* Totals (compact pills) */
+    .totals { display:flex; flex-wrap:wrap; gap:.4rem; padding:8px 12px; align-items:center; }
+    .pill { border:1px solid #ddd; border-radius:999px; padding:.25rem .6rem; font-size:.9rem; background:#fff; }
+    .pill.total { font-weight: 700; } /* Total cash en gras */
+
+    /* Names grid: 4 columns fixed */
+    .names-grid {
+      display:grid; grid-template-columns: repeat(4, 1fr);
+      gap:8px; padding:8px 12px;
+    }
+    .col { display:flex; flex-direction:column; gap:6px; }
+    .person { display:flex; align-items:center; justify-content:space-between; padding:6px 8px; border:1px solid #ddd; border-radius:10px; background:#fff; }
+    .name { font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:.95rem; padding-right:8px; }
+    .person.empty { visibility:hidden; }
+
+    /* Overlays / modals */
+    .overlay { position:fixed; inset:0; background:rgba(0,0,0,.45); display:none; align-items:center; justify-content:center; z-index:1000; }
+    .modal { background:#fff; border-radius:12px; width:min(92vw, 560px); padding:18px; box-shadow:0 10px 30px rgba(0,0,0,.2); }
+    .modal h3 { margin:0 0 8px 0; font-size:1.05rem; }
+    .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin:8px 0; }
+    .row label { display:flex; gap:8px; align-items:center; cursor:pointer; border:1px solid #ddd; border-radius:10px; padding:8px 10px; background:#fafafa; font-size:.95rem; }
+    .row input[type="radio"], .row input[type="checkbox"] { transform: scale(1.15); }
+    .modal-actions { display:flex; gap:10px; justify-content:flex-end; margin-top:12px; }
+    .modal input[type="text"] { width:100%; padding:10px 12px; border:1px solid #ccc; border-radius:10px; font-size:1rem; }
+
+    /* Qty (tactile simplifié) */
+    .qty-wrap { display:flex; gap:12px; align-items:center; justify-content:center; margin:12px 0; }
+    .qty-btn { width:88px; height:64px; border-radius:12px; border:1px solid #ccc; background:#f1f1f1; font-size:1.6rem; font-weight:700; cursor:pointer; user-select:none; display:flex; align-items:center; justify-content:center; }
+    .qty-display { min-width:100px; text-align:center; font-size:1.9rem; font-weight:800; border:1px solid #ddd; border-radius:12px; padding:6px 12px; background:#fff; }
+
+    /* Toast */
+    #toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.85); color: #fff; padding: 10px 14px; border-radius: 10px; font-size: .95rem; z-index: 1100; display:none; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1 id="title">Caisse</h1>
+    <div class="actions" id="actions">
+      <button id="walkinBtn" class="btn primary">+ Menu spontané</button>
+      <button id="sandBtn" class="btn secondary">+ Sandwich (CHF 6.-)</button>
+      <button id="bevBtn"  class="btn secondary">+ Boisson (CHF 2.-)</button>
+      <button id="chocBtn" class="btn secondary">+ Chocolat (CHF 1.50)</button>
+      <button id="closeBtn" class="btn danger">Fermer la caisse</button>
+    </div>
+  </header>
+
+  <section class="totals" id="totals"></section>
+  <section class="names-grid" id="names"></section>
+
+  <!-- Modal validation (menu) -->
+  <div id="overlay" class="overlay">
+    <div id="modal" class="modal">
+      <h3 id="who"></h3>
+      <div class="row" id="nameRow" style="display:none;">
+        <input type="text" id="nameInput" placeholder="Nom (facultatif)">
+      </div>
+      <div class="row" role="radiogroup" aria-label="Type d'utilisateur">
+        <label><input type="radio" name="rtype" value="ELEVE" checked> Élève (CHF 8.-)</label>
+        <label><input type="radio" name="rtype" value="PROF"> Prof (CHF 12.-)</label>
+      </div>
+      <div class="row" role="radiogroup" aria-label="Paiement">
+        <label><input type="radio" name="rpay" value="CASH" checked> Cash</label>
+        <label><input type="radio" name="rpay" value="CARD"> Carte abo (10 repas)</label>
+      </div>
+      <div class="row" aria-label="Extras">
+        <label><input type="checkbox" id="bev"> Boisson +CHF 2.-</label>
+        <label><input type="checkbox" id="choc"> Chocolat +CHF 1.50</label>
+      </div>
+      <div class="modal-actions">
+        <button class="btn sm" id="cancel">Annuler</button>
+        <button class="btn sm primary" id="ok">Valider</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal quantité (tactile simplifié) -->
+  <div id="qtyOverlay" class="overlay">
+    <div id="qtyModal" class="modal">
+      <h3 id="qtyTitle">Ajouter</h3>
+      <div class="qty-wrap">
+        <div class="qty-display" id="qtyDisplay">1</div>
+        <div class="qty-btn" id="plus1">+1</div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn sm" id="qtyCancel">Annuler</button>
+        <button class="btn sm primary" id="qtyOk">Ajouter</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal confirmation fermeture (tactile) -->
+  <div id="confirmOverlay" class="overlay">
+    <div id="confirmModal" class="modal">
+      <h3>Fermer la caisse ?</h3>
+      <p style="margin:.25rem 0 .5rem 0">Un e-mail de comptabilité va être envoyé et la caisse sera verrouillée.</p>
+      <div class="row" style="justify-content:center">
+        <button class="btn sm" id="confirmCancel">Annuler</button>
+        <button class="btn sm danger" id="confirmOk">Confirmer l'envoi</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+
+  <script>
+    var dateIso = null, currentName = null, isWalkIn = false, qty = 1, currentAddType = null;
+
+    function chf(n){ return (Math.round(n*100)/100).toFixed(2) + ' CHF'; }
+    function showToast(msg){ var t=document.getElementById('toast'); t.textContent=msg; t.style.display='block'; setTimeout(function(){ t.style.display='none'; },1400); }
+    function formatHeaderDate(iso){
+      if (!iso) return '';
+      var p = iso.split('-').map(Number), d = new Date(p[0], p[1]-1, p[2]);
+      var days = ['Dimanche','Lundi','Mardi','Mercredi','Jeudi','Vendredi','Samedi'];
+      return 'Caisse - ' + days[d.getDay()] + ' ' + String(p[2]).padStart(2,'0') + '.' + String(p[1]).padStart(2,'0');
+    }
+
+    function updateFromData(data){
+      dateIso = data.date || dateIso;
+      document.getElementById('title').textContent = formatHeaderDate(dateIso);
+
+      // Totaux (dont Total cash en gras)
+      var T = data.totals || {menus:0, eleves:0, profs:0, sandwiches:0, beverages:0, chocolates:0, amount:0};
+      var tdiv = document.getElementById('totals'); tdiv.innerHTML = '';
+
+      var items = [
+        'Menus: ' + T.menus + ' (élèves ' + (T.eleves||0) + ', profs ' + (T.profs||0) + ')',
+        'Sandwiches: ' + (T.sandwiches||0),
+        'Boissons: ' + (T.beverages||0),
+        'Chocolats: ' + (T.chocolates||0),
+        '<strong>Total cash: ' + chf(T.amount||0) + '</strong>'
+      ];
+      for (var i = 0; i < items.length; i++) {
+        var s = document.createElement('span');
+        s.className = 'pill' + (i === items.length - 1 ? ' total' : '');
+        if (i === items.length - 1) s.innerHTML = items[i]; else s.textContent = items[i];
+        tdiv.appendChild(s);
+      }
+
+      // Noms en 4 colonnes fixes de 10 (ordre conservé par le serveur)
+      var list = (data.names || []).slice(0, 40);
+      var box = document.getElementById('names'); box.innerHTML = '';
+      for (var col=0; col<4; col++){
+        var colDiv = document.createElement('div'); colDiv.className = 'col';
+        var slice = list.slice(col*10, col*10 + 10);
+        for (var i=0; i<10; i++){
+          var name = slice[i];
+          var row = document.createElement('div'); row.className = 'person' + (name ? '' : ' empty');
+          if (name) {
+            var left = document.createElement('div'); left.className = 'name'; left.textContent = name;
+            var btn  = document.createElement('button'); btn.className = 'btn sm primary'; btn.textContent = 'Valider';
+            btn.onclick = (function(nm){ return function(){ openModal(nm); }; })(name);
+            row.appendChild(left); row.appendChild(btn);
+          } else {
+            row.textContent = '—';
+          }
+          colDiv.appendChild(row);
+        }
+        box.appendChild(colDiv);
+      }
+    }
+
+    function refresh(){
+      google.script.run
+        .withSuccessHandler(updateFromData)
+        .withFailureHandler(function(err){ alert('Erreur chargement: ' + err); })
+        .getCaisseData(dateIso);
+    }
+
+    // ----- Modal validation -----
+    function openModal(name){
+      isWalkIn = false;
+      currentName = name;
+      document.getElementById('who').textContent = name;
+      document.getElementById('nameRow').style.display = 'none';
+      document.getElementById('nameInput').value = '';
+      document.getElementById('bev').checked = false;
+      document.getElementById('choc').checked = false;
+      document.querySelector('input[name="rtype"][value="ELEVE"]').checked = true;
+      document.querySelector('input[name="rpay"][value="CASH"]').checked  = true;
+      document.getElementById('overlay').style.display = 'flex';
+    }
+
+    function openWalkIn(){
+      isWalkIn = true;
+      currentName = null;
+      document.getElementById('who').textContent = 'Menu spontané';
+      document.getElementById('nameRow').style.display = 'flex';
+      document.getElementById('nameInput').value = '';
+      document.getElementById('bev').checked = false;
+      document.getElementById('choc').checked = false;
+      document.querySelector('input[name="rtype"][value="ELEVE"]').checked = true;
+      document.querySelector('input[name="rpay"][value="CASH"]').checked  = true;
+      document.getElementById('overlay').style.display = 'flex';
+    }
+
+    function closeModal(){ document.getElementById('overlay').style.display = 'none'; }
+    document.getElementById('cancel').onclick = closeModal;
+
+    document.getElementById('ok').onclick = function(){
+      var t    = document.querySelector('input[name="rtype"]:checked').value;
+      var pay  = document.querySelector('input[name="rpay"]:checked').value; // CASH | CARD
+      var bev  = document.getElementById('bev').checked;
+      var choc = document.getElementById('choc').checked;
+
+      var name = isWalkIn ? (document.getElementById('nameInput').value.trim() || 'Anonyme') : currentName;
+
+      google.script.run
+        .withSuccessHandler(function(data){
+          closeModal();
+          showToast('Validé ✔');
+          updateFromData(data);
+        })
+        .withFailureHandler(function(err){
+          alert(err);
+          refresh();
+        })
+        .checkout(name, t, bev, choc, dateIso, pay);
+    };
+
+    // ----- Modal quantité simplifié -----
+    function openQtyModal(kind){
+      currentAddType = kind; qty = 1;
+      document.getElementById('qtyDisplay').textContent = qty;
+      document.getElementById('qtyTitle').textContent =
+        kind==='sand' ? 'Ajouter des Sandwiches' : kind==='bev' ? 'Ajouter des Boissons' : 'Ajouter des Chocolats';
+      document.getElementById('qtyOverlay').style.display = 'flex';
+    }
+    function closeQtyModal(){ document.getElementById('qtyOverlay').style.display = 'none'; }
+    document.getElementById('plus1').onclick = function(){ qty = Math.min(999, qty+1); document.getElementById('qtyDisplay').textContent = qty; };
+    document.getElementById('qtyCancel').onclick = closeQtyModal;
+    document.getElementById('qtyOk').onclick = function(){
+      var f = currentAddType==='sand' ? 'addSandwich' : currentAddType==='bev' ? 'addBeverage' : 'addChocolate';
+      var txt = currentAddType==='sand' ? '+ Sandwich' : currentAddType==='bev' ? '+ Boisson' : '+ Chocolat';
+      google.script.run
+        .withSuccessHandler(function(data){ closeQtyModal(); showToast(txt); updateFromData(data); })
+        .withFailureHandler(function(err){ alert(err); closeQtyModal(); refresh(); })
+        [f](qty, dateIso);
+    };
+
+    // ----- Confirmation fermeture tactile -> redirection page Closed (via code.gs) -----
+    function openConfirm(){ document.getElementById('confirmOverlay').style.display = 'flex'; }
+    function closeConfirm(){ document.getElementById('confirmOverlay').style.display = 'none'; }
+    document.getElementById('confirmCancel').onclick = closeConfirm;
+    document.getElementById('confirmOk').onclick = function(){
+      google.script.run
+        .withSuccessHandler(function(resp){
+          closeConfirm();
+          var url = (resp && resp.closedUrl) ? resp.closedUrl : (location.pathname + '?page=closed');
+          window.location.replace(url);
+        })
+        .withFailureHandler(function(err){ alert('Erreur fermeture: ' + err); closeConfirm(); })
+        .closeCaisse(dateIso);
+    };
+
+    // ----- Header buttons -----
+    document.getElementById('walkinBtn').onclick = openWalkIn;
+    document.getElementById('sandBtn').onclick  = function(){ openQtyModal('sand'); };
+    document.getElementById('bevBtn').onclick   = function(){ openQtyModal('bev');  };
+    document.getElementById('chocBtn').onclick  = function(){ openQtyModal('choc'); };
+    document.getElementById('closeBtn').onclick = openConfirm;
+
+    // Boot
+    window.addEventListener('load', function(){
+      if (google && google.script && google.script.url) {
+        google.script.url.getLocation(function(loc){ dateIso = (loc.parameter && loc.parameter.date) || null; refresh(); });
+      } else { refresh(); }
+    });
+  </script>
+</body>
+</html>
