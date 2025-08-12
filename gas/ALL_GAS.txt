@@ -1,0 +1,1186 @@
+----- Code.gs -----
+// 1) Configuration
+var SPREADSHEET_ID = '1LkCQH5mK_Gc9JIfd6vxsDXphgwrrgT8mo91SzW6ib3E';
+var SS             = SpreadsheetApp.openById(SPREADSHEET_ID);
+var SHEET_PARAMS   = SS.getSheetByName('Paramètres');
+var SHEET_RESAS    = SS.getSheetByName('Réservations');
+
+// URL /exec de la Web App (utilisée dans les e-mails pour le lien Caisse)
+var WEBAPP_URL     = 'https://script.google.com/macros/s/AKfycbxT7RSfN3AsU6McW7Jeay5Ynvrc1Uurke6TbhZ13VO1ULzAaoihV1qVkzydqiRHvGMZ/exec';
+
+// 2) Tarifs & fond de caisse
+var PRICES     = { ELEVE: 8, PROF: 12, SANDWICH: 6, BOISSON: 2, CHOCOLAT: 1.5 };
+var CASH_FLOAT = 150; // fond de caisse
+
+// ---------- Helpers ----------
+function getWebAppUrl_() {
+  if (WEBAPP_URL) return WEBAPP_URL;
+  try { return ScriptApp.getService().getUrl(); } catch (e) { return ''; }
+}
+function getTodayIso_() {
+  var tz = 'Europe/Zurich', d = new Date();
+  return Utilities.formatDate(new Date(d.getFullYear(), d.getMonth(), d.getDate()), tz, 'yyyy-MM-dd');
+}
+function prettyFrHeader_(iso) { // "Lundi 11.08"
+  var p = (iso||'').split('-').map(Number);
+  if (p.length !== 3) return iso || '';
+  var d = new Date(p[0], p[1]-1, p[2]);
+  var days = ['Dimanche','Lundi','Mardi','Mercredi','Jeudi','Vendredi','Samedi'];
+  var dd = String(p[2]).padStart(2,'0');
+  var mm = String(p[1]).padStart(2,'0');
+  return days[d.getDay()] + ' ' + dd + '.' + mm;
+}
+function normName_(s) { return (s||'').toString().trim().replace(/\s+/g,' ').toUpperCase(); }
+function toIso_(val, tz) {
+  if (val instanceof Date) {
+    return Utilities.formatDate(new Date(val.getFullYear(), val.getMonth(), val.getDate()), tz, 'yyyy-MM-dd');
+  }
+  var s = (val||'').toString().trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  var d = new Date(s);
+  if (!isNaN(d.getTime())) return Utilities.formatDate(new Date(d.getFullYear(), d.getMonth(), d.getDate()), tz, 'yyyy-MM-dd');
+  return '';
+}
+function getOrCreateCaisseSheet_() {
+  var sh = SS.getSheetByName('Caisse');
+  if (!sh) {
+    sh = SS.insertSheet('Caisse');
+    sh.appendRow(['date','nom','type','base','boisson','chocolat','total','timestamp']);
+  }
+  return sh;
+}
+function isCaisseClosed_(targetIso) {
+  var tz = 'Europe/Zurich';
+  var data = getOrCreateCaisseSheet_().getDataRange().getValues();
+  for (var i = 1; i < data.length; i++) {
+    if (toIso_(data[i][0], tz) === targetIso && (data[i][2]+'') === 'Closed') return true;
+  }
+  return false;
+}
+
+// 3) Router : Page / Caisse / Closed
+function doGet(e) {
+  var page = e && e.parameter && e.parameter.page;
+  if (page === 'caisse') {
+    var iso = (e.parameter && /^\d{4}-\d{2}-\d{2}$/.test(e.parameter.date)) ? e.parameter.date : getTodayIso_();
+    if (isCaisseClosed_(iso)) page = 'closed';
+  }
+  var tpl = page === 'caisse' ? 'Caisse' : (page === 'closed' ? 'Closed' : 'Page');
+  return HtmlService.createTemplateFromFile(tpl)
+    .evaluate()
+    .setTitle('Réservation Cafétéria')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+// ======== API Inscription (Page.html) ========
+
+function getInitialData() {
+  var days = getAvailableDays();
+  var rows = SHEET_RESAS.getDataRange().getValues().slice(1);
+
+  var map = {};
+  days.forEach(function(d){ map[d.date] = []; });
+  rows.forEach(function(r){
+    var raw = r[0] instanceof Date ? r[0] : new Date(r[0]);
+    var dd  = Utilities.formatDate(raw, 'Europe/Zurich', 'dd.MM.yyyy');
+    if (map[dd]) map[dd].push(r[1]);
+  });
+
+  return { days: days, reservations: map };
+}
+
+function getAvailableDays() {
+  const tz = 'Europe/Zurich';
+  const today = new Date(); today.setHours(0,0,0,0);
+  const wanted = [
+    { nom: 'Lundi',    dow: 1 },
+    { nom: 'Mardi',    dow: 2 },
+    { nom: 'Jeudi',    dow: 4 },
+    { nom: 'Vendredi', dow: 5 }
+  ];
+
+  const sheet   = SHEET_PARAMS;
+  const lastRow = sheet.getLastRow();
+  const range   = sheet.getRange(2, 1, Math.max(0, lastRow - 1), 4);
+  const values  = lastRow > 1 ? range.getValues()     : [];
+  const colors  = lastRow > 1 ? range.getFontColors() : [];
+
+  const rows = values.map((r,i) => {
+    const d   = r[0] instanceof Date ? r[0] : new Date(r[0]);
+    const red = (colors[i] && colors[i][2] ? colors[i][2] : '').toLowerCase().startsWith('#ff');
+    return { date:d, jour:r[1], menu:r[2], open:r[3]===true, disabled:red };
+  });
+
+  return wanted.map(w => {
+    const openCandidates = rows.filter(e => e.jour===w.nom && e.open && e.date>=today).sort((a,b)=>a.date-b.date);
+    if (openCandidates.length) {
+      const e = openCandidates[0];
+      return {
+        date: Utilities.formatDate(e.date, tz, 'dd.MM.yyyy'),
+        jour: w.nom, menu: e.menu, open: true, disabled: e.disabled
+      };
+    }
+    const d = new Date(today);
+    do { d.setDate(d.getDate()+1); } while (d.getDay()!==w.dow);
+    return { date: Utilities.formatDate(d, tz, 'dd.MM.yyyy'), jour: w.nom, menu: '', open: false, disabled: false };
+  });
+}
+
+// Robuste (accepte dd.MM.yyyy / yyyy-MM-dd / Date ; défaut = aujourd’hui)
+function getReservations(dateStr) {
+  var tz = 'Europe/Zurich', d;
+  if (!dateStr) {
+    var now = new Date(); d = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  } else if (dateStr instanceof Date) {
+    d = new Date(dateStr.getFullYear(), dateStr.getMonth(), dateStr.getDate());
+  } else if (/^\d{2}\.\d{2}\.\d{4}$/.test(dateStr)) {
+    var p = dateStr.split('.'); d = new Date(parseInt(p[2],10), parseInt(p[1],10)-1, parseInt(p[0],10));
+  } else if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+    var q = dateStr.split('-'); d = new Date(parseInt(q[0],10), parseInt(q[1],10)-1, parseInt(q[2],10));
+  } else {
+    var tmp = new Date(dateStr);
+    if (isNaN(tmp.getTime())) throw new Error("Paramètre 'dateStr' invalide. Utilisez 'dd.MM.yyyy', 'yyyy-MM-dd' ou une Date.");
+    d = new Date(tmp.getFullYear(), tmp.getMonth(), tmp.getDate());
+  }
+
+  var isoDate = Utilities.formatDate(d, tz, 'yyyy-MM-dd');
+  var data = SHEET_RESAS.getDataRange().getValues();
+  var names = [];
+  for (var i = 1; i < data.length; i++) {
+    var raw = data[i][0];
+    var dt  = raw instanceof Date ? raw : new Date(raw);
+    var f   = Utilities.formatDate(new Date(dt.getFullYear(), dt.getMonth(), dt.getDate()), tz, 'yyyy-MM-dd');
+    if (f === isoDate) names.push(data[i][1]);
+  }
+  return names;
+}
+
+function reserve(name, dateStr) {
+  const parts = dateStr.split('.');
+  const d = new Date(parseInt(parts[2],10), parseInt(parts[1],10)-1, parseInt(parts[0],10));
+  const isoDate = Utilities.formatDate(d, 'Europe/Zurich', 'yyyy-MM-dd');
+
+  const params = SHEET_PARAMS.getDataRange().getValues().slice(1);
+  const match = params.find(r=>{
+    const cd = r[0] instanceof Date ? r[0] : new Date(r[0]);
+    const f  = Utilities.formatDate(new Date(cd.getFullYear(), cd.getMonth(), cd.getDate()), 'Europe/Zurich', 'yyyy-MM-dd');
+    return f === isoDate && r[3] === true;
+  });
+  if (!match) throw 'Le ' + dateStr + ' est fermé, impossible de réserver.';
+
+  const all = SHEET_RESAS.getDataRange().getValues().slice(1);
+  const existing = all.filter(row=>{
+    const cd = row[0] instanceof Date ? row[0] : new Date(row[0]);
+    const f  = Utilities.formatDate(new Date(cd.getFullYear(), cd.getMonth(), cd.getDate()), 'Europe/Zurich', 'yyyy-MM-dd');
+    return f === isoDate;
+  }).length;
+  if (existing >= 40) throw 'Quota de 40 atteint pour le ' + dateStr + '.';
+
+  SHEET_RESAS.appendRow([isoDate, name, new Date()]);
+  return 'Merci ' + name + ', réservation confirmée pour le ' + dateStr + ' !';
+}
+
+function unreserve(name, dateStr) {
+  var parts = dateStr.split('.');
+  var d     = new Date(parseInt(parts[2],10), parseInt(parts[1],10)-1, parseInt(parts[0],10));
+  var isoDate = Utilities.formatDate(d, 'Europe/Zurich', 'yyyy-MM-dd');
+  var target  = name.toString().trim();
+
+  var all = SHEET_RESAS.getDataRange().getValues();
+  for (var i = 1; i < all.length; i++) {
+    var raw     = all[i][0];
+    var cd      = raw instanceof Date ? raw : new Date(raw);
+    var f       = Utilities.formatDate(new Date(cd.getFullYear(), cd.getMonth(), cd.getDate()), 'Europe/Zurich', 'yyyy-MM-dd');
+    var rowName = all[i][1] ? all[i][1].toString().trim() : '';
+    if (f === isoDate && rowName === target) {
+      SHEET_RESAS.deleteRow(i+1);
+      return 'Vous êtes désinscrit pour le ' + dateStr + '.';
+    }
+  }
+  throw 'Pas de réservation trouvée pour "' + name + '" le ' + dateStr + '.';
+}
+
+// ======== Envoi liste (4×10) + lien CAISSE, puis fermeture inscriptions ========
+
+function sendListAndClose() {
+  var tz       = 'Europe/Zurich';
+  var todayIso = getTodayIso_();
+
+  var all  = SHEET_RESAS.getDataRange().getValues();
+  var rows = [];
+  for (var i = 1; i < all.length; i++) {
+    var raw = all[i][0];
+    var d   = raw instanceof Date ? raw : new Date(raw);
+    var f   = Utilities.formatDate(new Date(d.getFullYear(), d.getMonth(), d.getDate()), tz, 'yyyy-MM-dd');
+    if (f === todayIso) rows.push(all[i]);  // [date, nom, timestamp]
+  }
+
+  var bodyText = '', htmlBody = '';
+
+  if (rows.length === 0) {
+    bodyText = 'Aucune réservation pour aujourd’hui.';
+    htmlBody = '<p>Aucune réservation pour aujourd\u2019hui.</p>';
+  } else {
+    var max  = Math.min(rows.length, 40);   // 4 colonnes x 10
+    var cols = [[], [], [], []];
+
+    for (var idx = 0; idx < max; idx++) {
+      var c = Math.floor(idx / 10);     // 0..3
+      var r = idx % 10;                 // 0..9
+      cols[c][r] = rows[idx][1] || '';
+    }
+
+    function pad(s, w){ s = (s||'').toString(); return (s + Array(w+1).join(' ')).slice(0, w); }
+    var lines = [];
+    for (var ri = 0; ri < 10; ri++) {
+      lines.push([0,1,2,3].map(function(ci){ return pad(cols[ci][ri],22); }).join('  |  '));
+    }
+    bodyText = 'Réservations (' + max + ')\n' + lines.join('\n');
+
+    function esc(x){
+      return String(x||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+        .replace(/\\"/g,'&quot;').replace(/'/g,'&#39;');
+    }
+    var html = [];
+    html.push('<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;">');
+    html.push('<h3 style="margin:0 0 8px 0;">Liste des réservations pour ' + prettyFrHeader_(todayIso) + '</h3>');
+    html.push('<table style="border-collapse:collapse;width:100%;max-width:700px;">');
+    for (var ri = 0; ri < 10; ri++) {
+      html.push('<tr>');
+      for (var ci = 0; ci < 4; ci++) {
+        var cell = cols[ci][ri] ? esc(cols[ci][ri]) : '&nbsp;';
+        html.push('<td style="border:1px solid #ddd;padding:6px 8px;">' + cell + '</td>');
+      }
+      html.push('</tr>');
+    }
+    html.push('</table></div>');
+    htmlBody = html.join('');
+  }
+
+  var webUrl = getWebAppUrl_();
+  if (webUrl) {
+    var caisseUrl = webUrl + '?page=caisse&date=' + todayIso;
+    htmlBody += '<p style="margin-top:12px;"><a href="' + caisseUrl + '">Ouvrir la page CAISSE pour ' + prettyFrHeader_(todayIso) + '</a></p>';
+    bodyText += '\n\nOuvrir la page CAISSE : ' + caisseUrl;
+  }
+
+  MailApp.sendEmail({
+    to:      'frank.bader@etat.ge.ch',
+    subject: 'Liste des réservations — ' + prettyFrHeader_(todayIso),
+    body:    bodyText,
+    htmlBody: htmlBody
+  });
+
+  // Fermer le jour (Paramètres!D = FALSE)
+  var params = SHEET_PARAMS.getDataRange().getValues();
+  for (var k = 1; k < params.length; k++) {
+    var dp = params[k][0] instanceof Date ? params[k][0] : new Date(params[k][0]);
+    var fp = Utilities.formatDate(new Date(dp.getFullYear(), dp.getMonth(), dp.getDate()), tz, 'yyyy-MM-dd');
+    if (fp === todayIso) { SHEET_PARAMS.getRange(k+1, 4).setValue(false); break; }
+  }
+}
+
+// ======== Back-end CAISSE ========
+
+function buildCaisseStats_(targetIso) {
+  var tz = 'Europe/Zurich';
+  var sh = getOrCreateCaisseSheet_();
+  var data = sh.getDataRange().getValues();
+
+  var totals = {
+    menus:0, eleves:0, profs:0,
+    sandwiches:0, beverages:0, chocolates:0,
+    amount:0 // CASH encaissé (menus cash + extras + produits)
+  };
+  var paidCount = {};
+
+  for (var r = 1; r < data.length; r++) {
+    var row = data[r];
+    if (toIso_(row[0], tz) !== targetIso) continue;
+
+    var type = (row[2]||'').toString(); // Eleve (CASH) / Eleve (CARD) / Prof (...) / Sandwich / Boisson / Chocolat / Closed
+    var base = Number(row[3])||0, bev = Number(row[4])||0, choc = Number(row[5])||0, tot = Number(row[6])||0;
+
+    if (type === 'Closed') {
+      // ignore
+    } else if (type === 'Sandwich') {
+      totals.sandwiches += 1;
+    } else if (type === 'Boisson') {
+      totals.beverages += 1;
+    } else if (type === 'Chocolat') {
+      totals.chocolates += 1;
+    } else {
+      // Menu (cash ou carte)
+      totals.menus += 1;
+      if (type.toLowerCase().indexOf('eleve') >= 0) totals.eleves += 1; else totals.profs += 1;
+
+      // Compter le passage (réduction file d'attente)
+      var nkey = normName_(row[1]||'');
+      if (nkey) paidCount[nkey] = (paidCount[nkey]||0) + 1;
+
+      // boisson/choco inclus dans "menu" (cochés) → déjà dans tot
+      if (bev > 0) totals.beverages += 1;
+      if (choc > 0) totals.chocolates += 1;
+    }
+    // tot = CASH encaissé pour cette ligne (pour carte : base exclue, tot = extras)
+    totals.amount += tot;
+  }
+
+  return { totals: totals, paidCount: paidCount, closed: isCaisseClosed_(targetIso) };
+}
+
+// IMPORTANT : ordre identique à la liste d'inscription
+function getCaisseData(dateIso) {
+  var tz = 'Europe/Zurich';
+  var targetIso = (dateIso && /^\d{4}-\d{2}-\d{2}$/.test(dateIso)) ? dateIso : getTodayIso_();
+
+  var stats = buildCaisseStats_(targetIso);
+  if (stats.closed) {
+    return { date: targetIso, closed: true, names: [], totals: stats.totals };
+  }
+
+  // 1) Réservations du jour DANS L’ORDRE DES LIGNES (file d’attente)
+  var data = SHEET_RESAS.getDataRange().getValues();
+  var ordered = []; // [{name, key}]
+  for (var i = 1; i < data.length; i++) {
+    var raw  = data[i][0];
+    var name = (data[i][1] || '').toString().trim();
+    if (!name) continue;
+    var iso  = toIso_(raw, tz);
+    if (iso !== targetIso) continue;
+    ordered.push({ name: name, key: normName_(name) });
+  }
+
+  // 2) Soustraire les validations existantes (file d’attente)
+  var paidLeft = Object.assign({}, stats.paidCount);
+  var remaining = [];
+  for (var j = 0; j < ordered.length; j++) {
+    var k = ordered[j].key;
+    if (paidLeft[k] > 0) paidLeft[k]--; else remaining.push(ordered[j].name);
+  }
+
+  return { date: targetIso, closed: false, names: remaining, totals: stats.totals };
+}
+
+function assertOpenOrThrow_(targetIso) { if (isCaisseClosed_(targetIso)) throw 'Caisse fermée pour ' + targetIso + '.'; }
+
+// Limite de 45 menus servis (inscrits + spontanés)
+function assertMenuCapacity_(targetIso) {
+  var stats = buildCaisseStats_(targetIso).totals;
+  if (stats.menus >= 45) throw 'Limite de 45 menus servis atteinte pour ' + prettyFrHeader_(targetIso) + '.';
+}
+
+// Checkout (avec méthode de paiement : 'CASH' ou 'CARD')
+// Pour 'CARD' : base du menu n’est PAS encaissée ; seuls les extras (boisson/chocolat) entrent dans le cash.
+function checkout(name, type, beverage, chocolate, dateIso, method) {
+  name = (name||'').toString().trim() || 'Anonyme';
+  var targetIso = (dateIso && /^\d{4}-\d{2}-\d{2}$/.test(dateIso)) ? dateIso : getTodayIso_();
+  assertOpenOrThrow_(targetIso);
+  assertMenuCapacity_(targetIso);
+
+  type = (type||'PROF').toString().toUpperCase();
+  method = (method||'CASH').toString().toUpperCase(); // 'CASH' | 'CARD'
+
+  var base = (type === 'ELEVE') ? PRICES.ELEVE : PRICES.PROF;
+  var bev  = beverage  ? PRICES.BOISSON   : 0;
+  var choc = chocolate ? PRICES.CHOCOLAT  : 0;
+  var totalCash = (method === 'CARD') ? (bev + choc) : (base + bev + choc);
+
+  var typeLabel = (type==='ELEVE'?'Eleve':'Prof') + (method==='CARD'?' (CARD)':' (CASH)');
+
+  var sh = getOrCreateCaisseSheet_();
+  sh.appendRow([targetIso, name, typeLabel, base, bev, choc, totalCash, new Date()]);
+  return getCaisseData(targetIso);
+}
+
+// Produits rapides (toujours cash)
+function addSandwich(qty, dateIso) {
+  var n = Math.max(1, parseInt(qty,10)||1);
+  var targetIso = (dateIso && /^\d{4}-\d{2}-\d{2}$/.test(dateIso)) ? dateIso : getTodayIso_();
+  assertOpenOrThrow_(targetIso);
+  var sh = getOrCreateCaisseSheet_();
+  for (var i=0; i<n; i++) sh.appendRow([targetIso, '', 'Sandwich', PRICES.SANDWICH, 0, 0, PRICES.SANDWICH, new Date()]);
+  return getCaisseData(targetIso);
+}
+function addBeverage(qty, dateIso) {
+  var n = Math.max(1, parseInt(qty,10)||1);
+  var targetIso = (dateIso && /^\d{4}-\d{2}-\d{2}$/.test(dateIso)) ? dateIso : getTodayIso_();
+  assertOpenOrThrow_(targetIso);
+  var sh = getOrCreateCaisseSheet_();
+  for (var i=0; i<n; i++) sh.appendRow([targetIso, '', 'Boisson', 0, PRICES.BOISSON, 0, PRICES.BOISSON, new Date()]);
+  return getCaisseData(targetIso);
+}
+function addChocolate(qty, dateIso) {
+  var n = Math.max(1, parseInt(qty,10)||1);
+  var targetIso = (dateIso && /^\d{4}-\d{2}-\d{2}$/.test(dateIso)) ? dateIso : getTodayIso_();
+  assertOpenOrThrow_(targetIso);
+  var sh = getOrCreateCaisseSheet_();
+  for (var i=0; i<n; i++) sh.appendRow([targetIso, '', 'Chocolat', 0, 0, PRICES.CHOCOLAT, PRICES.CHOCOLAT, new Date()]);
+  return getCaisseData(targetIso);
+}
+
+// Fermer la caisse : e-mail + drapeau "Closed" + URL de redirection
+function closeCaisse(dateIso) {
+  var targetIso = (dateIso && /^\d{4}-\d{2}-\d{2}$/.test(dateIso)) ? dateIso : getTodayIso_();
+
+  if (!isCaisseClosed_(targetIso)) {
+    var stats = buildCaisseStats_(targetIso).totals;
+
+    var subject = 'Comptabilité cafétéria — ' + prettyFrHeader_(targetIso);
+
+    // Cash encaissé = stats.amount (menus cash + extras + produits)
+    var cashIn = Math.round(stats.amount*100)/100;
+    var totalInTill = Math.round((CASH_FLOAT + cashIn)*100)/100;
+
+    var body = [
+      'Date : ' + prettyFrHeader_(targetIso),
+      '',
+      'Menus : ' + stats.menus + ' (élèves ' + stats.eleves + ', profs ' + stats.profs + ')',
+      'Sandwiches : ' + stats.sandwiches,
+      'Boissons : ' + stats.beverages,
+      'Chocolats : ' + stats.chocolates,
+      '',
+      'Fond de caisse initial : ' + CASH_FLOAT.toFixed(2) + ' CHF',
+      'Encaissements cash : ' + cashIn.toFixed(2) + ' CHF',
+      'Total en caisse attendu : ' + totalInTill.toFixed(2) + ' CHF'
+    ].join('\n');
+
+    var html = [];
+    html.push('<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;">');
+    html.push('<h3 style="margin:0 0 10px 0;">Comptabilité — ' + prettyFrHeader_(targetIso) + '</h3>');
+    html.push('<table style="border-collapse:collapse;">');
+    function row(label,val){ html.push('<tr><td style="border:1px solid #ddd;padding:6px 10px;">'+label+'</td><td style="border:1px solid #ddd;padding:6px 10px;text-align:right;">'+val+'</td></tr>'); }
+    row('Menus (total)', String(stats.menus));
+    row('— Élèves',     String(stats.eleves));
+    row('— Profs',      String(stats.profs));
+    row('Sandwiches',   String(stats.sandwiches));
+    row('Boissons',     String(stats.beverages));
+    row('Chocolats',    String(stats.chocolates));
+    row('<b>Fond de caisse initial</b>', '<b>'+CASH_FLOAT.toFixed(2)+' CHF</b>');
+    row('<b>Encaissements cash</b>',     '<b>'+cashIn.toFixed(2)+' CHF</b>');
+    row('<b>Total en caisse attendu</b>','<b>'+totalInTill.toFixed(2)+' CHF</b>');
+    html.push('</table></div>');
+
+    MailApp.sendEmail({
+      to: 'frank.bader@etat.ge.ch',
+      subject: subject,
+      body: body,
+      htmlBody: html.join('')
+    });
+
+    // Marqueur de fermeture
+    getOrCreateCaisseSheet_().appendRow([targetIso, '', 'Closed', 0, 0, 0, 0, new Date()]);
+  }
+
+  var url = getWebAppUrl_();
+  var closedUrl = url ? (url + '?page=closed') : '';
+  return { closedUrl: closedUrl };
+}
+
+-- Page.html --
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+  <title>CAFÉTÉRIA CO FLORENCE</title>
+  <style>
+    html {
+      font-size: calc(16px + (24 - 16) * ((100vw - 320px) / (1920 - 320)));
+    }
+    body {
+      margin: 0; padding: 0;
+      font-family: sans-serif;
+      text-align: center;
+    }
+    h1 {
+      font-size: 4em;
+      color: red;
+      margin: 1.5em 0 0.15em;
+    }
+    h2 {
+      font-size: 2em;
+      margin: 1em 0 0.5em;
+    }
+
+    /* Day blocks */
+    .jour {
+      display: inline-block; vertical-align: top;
+      width: 15vw; margin: 1vw; padding: 1.5vw;
+      border: 0.2vw solid #ccc; border-radius: 1vw;
+      cursor: pointer; transition: opacity .3s;
+      font-size: 1.1em; color: inherit;
+    }
+    .jour.closed { opacity: .4; cursor: not-allowed; }
+    .jour.disabled {
+      border-color: red; color: red;
+    }
+    .jour.disabled strong,
+    .jour.disabled .date,
+    .jour.disabled .menu {
+      color: red;
+    }
+    .jour strong {
+      display: block; font-size: 1.4em; margin-bottom: .5vw;
+    }
+    .jour .date {
+      display: block; font-weight: bold; margin-bottom: 1vw;
+    }
+    .menu {
+      white-space: pre-line; margin-top: 1vw; font-size: 1em;
+    }
+
+    /* Action buttons */
+    .top-actions {
+      margin: 2vw 0;
+      display: flex; justify-content: center; gap: 2vw;
+    }
+    .top-actions button {
+      padding: 1vw 2vw; font-size: 1.2em; font-weight: bold;
+      background: #007bff; color: #fff; border: none;
+      border-radius: 1vw; cursor: pointer;
+    }
+    .top-actions button:hover {
+      background: #0056b3;
+    }
+
+    /* Participants grid */
+    .participants-container {
+      display: flex; justify-content: center; gap: 1vw;
+      margin: 2vw auto; max-width: 80vw;
+    }
+    .participants-column {
+      flex: 1; display: flex; flex-direction: column; gap: .25vw;
+    }
+    .participant {
+      padding: .3vw 1vw; font-size: .7em;
+      border: .1vw solid #ccc; border-radius: 1vw;
+      cursor: pointer; text-align: center;
+    }
+
+    /* Modal overlay */
+    #modalOverlay {
+      position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0,0,0,0.5);
+      display: none; align-items: center; justify-content: center;
+      z-index: 1000;
+    }
+    /* Modal box adapts to content width */
+    #modalBox {
+      display: inline-block;
+      background: #fff; padding: 2vw;
+      border-radius: 1vw;
+      box-shadow: 0 .5vw 2vw rgba(0,0,0,0.3);
+      max-width: 95vw; max-height: 95vh;
+      overflow: auto; text-align: center;
+      box-sizing: border-box;
+    }
+    #modalBox input {
+      width: 100%; padding: 1vw; font-size: 1em;
+      margin-bottom: 1vw; box-sizing: border-box;
+    }
+    /* Virtual keyboard */
+    #virtualKeyboard {
+      display: flex; flex-direction: column; gap: 1vw;
+      margin-bottom: 1vw;
+    }
+    #virtualKeyboard .row {
+      display: flex; justify-content: center; gap: 1vw;
+    }
+    #virtualKeyboard .key {
+      flex: 1; min-width: 8vw; padding: 2vw 0;
+      background: #e0e0e0; border-radius: 1vw;
+      text-align: center; font-size: 1.5em;
+      cursor: pointer; user-select: none;
+    }
+    #virtualKeyboard .key.wide {
+      flex: 4;
+    }
+    #virtualKeyboard .key:active {
+      background: #ccc;
+    }
+    /* Buttons under keyboard */
+    #modalBox .buttons {
+      display: flex; justify-content: flex-end; gap: 1vw;
+    }
+    #modalBox .buttons button {
+      padding: 1vw 2vw; font-size: 1em;
+      border: none; border-radius: .5vw;
+      background: #007bff; color: #fff;
+      cursor: pointer;
+    }
+    #modalBox .buttons button:hover {
+      background: #0056b3;
+    }
+    #footer {
+      position: fixed;
+      bottom: 0.5vw;
+      left: 0;
+      width: 100%;
+      text-align: center;
+      font-size: 1em;
+      color: red;
+      padding: 0.2vw 0;
+      background: rgba(255,255,255,0.8);
+    }
+  </style>
+</head>
+<body>
+  <h1>CAFÉTÉRIA CO FLORENCE</h1>
+  <div id="jours"></div>
+  <div id="list" style="display:none;"></div>
+  <div id="modalOverlay"><div id="modalBox"></div></div>
+
+  <script>
+    var availableDays = [], reservationsMap = {};
+
+    // Auto-refresh à 07:00 et 12:00 (heure locale)
+    function scheduleDailyReload(hour, minute) {
+      function msUntilNext(h, m) {
+        var now = new Date();
+        var target = new Date(now.getFullYear(), now.getMonth(), now.getDate(), h, m, 0, 0);
+        if (target <= now) target.setDate(target.getDate() + 1);
+        return target - now;
+      }
+      function plan() {
+        var delay = msUntilNext(hour, minute);
+        setTimeout(function() {
+          // Recharge "forte" en ajoutant un paramètre anti-cache
+          var base = location.href.split('#')[0].split('?')[0];
+          location.replace(base + '?_r=' + Date.now());
+        }, delay);
+      }
+      plan();
+    }
+
+    function loadInitialData() {
+      google.script.run
+        .withSuccessHandler(function(data) {
+          availableDays   = data.days;
+          reservationsMap = data.reservations;
+          renderHome();
+        })
+        .getInitialData();
+    }
+
+    function renderHome() {
+      var joursDiv = document.getElementById('jours'),
+          listDiv  = document.getElementById('list');
+      listDiv.style.display = 'none';
+      joursDiv.style.display = 'block';
+      joursDiv.innerHTML = '';
+
+      availableDays.forEach(function(d) {
+        var div = document.createElement('div'),
+            cls = ['jour'];
+        if (!d.open)      cls.push('closed');
+        if (d.disabled)   cls.push('disabled');
+        div.className = cls.join(' ');
+        div.innerHTML =
+          '<strong>' + d.jour + '</strong>' +
+          '<span class="date">' + d.date + '</span>' +
+          '<div class="menu">' + d.menu + '</div>';
+        if (d.open && !d.disabled) {
+          div.onclick = function() { showList(d.date); };
+        }
+        joursDiv.appendChild(div);
+      });
+    }
+
+    function showList(date) {
+      var joursDiv = document.getElementById('jours'),
+          listDiv  = document.getElementById('list');
+      joursDiv.style.display = 'none';
+      listDiv.style.display  = 'block';
+      listDiv.innerHTML      = '';
+
+      var dayObj = availableDays.find(function(d){ return d.date === date; });
+
+      var h2 = document.createElement('h2');
+      h2.textContent = 'Inscriptions pour ' +
+        (dayObj ? dayObj.jour + ' ' : '') + date;
+      listDiv.appendChild(h2);
+
+      if (dayObj) {
+        var menuDiv = document.createElement('div');
+        menuDiv.className = 'menu';
+        menuDiv.textContent = dayObj.menu;
+        listDiv.appendChild(menuDiv);
+      }
+
+      var list = reservationsMap[date] || [];
+      var actions = document.createElement('div');
+      actions.className = 'top-actions';
+
+      var backBtn = document.createElement('button');
+      backBtn.textContent = '← Retour';
+      backBtn.onclick = renderHome;
+      actions.appendChild(backBtn);
+
+      // Only show "S'inscrire" if fewer than 40 reservations
+      if (list.length < 40) {
+        var inscBtn = document.createElement('button');
+        inscBtn.textContent = "S'inscrire";
+        inscBtn.onclick = function() { openRegisterModal(date); };
+        actions.appendChild(inscBtn);
+      }
+
+      listDiv.appendChild(actions);
+
+      var container = document.createElement('div');
+      container.className = 'participants-container';
+      for (var col = 0; col < 4; col++) {
+        var colDiv = document.createElement('div');
+        colDiv.className = 'participants-column';
+        var slice = list.slice(col * 10, col * 10 + 10);
+        if (!slice.length) {
+          var empty = document.createElement('div');
+          empty.style.visibility = 'hidden';
+          empty.textContent = '—';
+          colDiv.appendChild(empty);
+        }
+        slice.forEach(function(name) {
+          var p = document.createElement('div');
+          p.className = 'participant';
+          p.textContent = name;
+          p.onclick = function() { openUnregisterModal(name, date); };
+          colDiv.appendChild(p);
+        });
+        container.appendChild(colDiv);
+      }
+      listDiv.appendChild(container);
+    }
+
+    function openRegisterModal(date) {
+      showModal(
+        '<input id="regName" placeholder="Votre nom" readonly>' +
+        '<div id="virtualKeyboard"></div>' +
+        '<div class="buttons">' +
+          '<button id="regCancel">Annuler</button>' +
+          '<button id="regOk">Valider</button>' +
+        '</div>',
+        function() {
+          initKeyboard('regName');
+          document.getElementById('regCancel').onclick = closeModal;
+          document.getElementById('regOk').onclick = function() {
+            var name = document.getElementById('regName').value.trim();
+            if (!name) return;
+            google.script.run.withSuccessHandler(function(msg) {
+              showTemp(msg);
+            }).reserve(name, date);
+            closeModal();
+          };
+        }
+      );
+    }
+
+    function initKeyboard(inputId) {
+      var layout = [
+        ['1','2','3','4','5','6','7','8','9','0'],
+        ['Q','W','E','R','T','Z','U','I','O','P'],
+        ['A','S','D','F','G','H','J','K','L','M'],
+        ['Y','X','C','V','B','N','-',"'",'.'],
+        ['Space','Backspace']
+      ];
+      var kb = document.getElementById('virtualKeyboard');
+      kb.innerHTML = '';
+      layout.forEach(function(row) {
+        var rowDiv = document.createElement('div');
+        rowDiv.className = 'row';
+        row.forEach(function(k) {
+          var key = document.createElement('div');
+          key.className = 'key' + (k === 'Space' ? ' wide' : '');
+          key.textContent = k === 'Space' ? '⎵' : k;
+          key.onclick = function() {
+            var inp = document.getElementById(inputId);
+            if (k === 'Backspace') inp.value = inp.value.slice(0, -1);
+            else if (k === 'Space') inp.value += ' ';
+            else inp.value += k;
+          };
+          rowDiv.appendChild(key);
+        });
+        kb.appendChild(rowDiv);
+      });
+    }
+
+    function openUnregisterModal(name, date) {
+      showModal(
+        '<h3>Désinscrire ' + name + '</h3>' +
+        '<p>Le ' + date + ' ?</p>' +
+        '<div class="buttons">' +
+          '<button id="unregCancel">Annuler</button>' +
+          '<button id="unregOk">Confirmer</button>' +
+        '</div>',
+        function() {
+          document.getElementById('unregCancel').onclick = closeModal;
+          document.getElementById('unregOk').onclick = function() {
+            google.script.run.withSuccessHandler(function(msg) {
+              showTemp(msg);
+            }).unreserve(name, date);
+            closeModal();
+          };
+        }
+      );
+    }
+
+    function showModal(html, bindFn) {
+      var ov = document.getElementById('modalOverlay'),
+          box = document.getElementById('modalBox');
+      box.innerHTML = html;
+      ov.style.display = 'flex';
+      bindFn();
+    }
+    function closeModal() {
+      document.getElementById('modalOverlay').style.display = 'none';
+    }
+    function showTemp(msg) {
+      var t = document.createElement('div');
+      t.textContent = msg;
+      t.style.cssText =
+        'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);' +
+        'background:rgba(0,0,0,0.8);color:#fff;padding:12px 24px;' +
+        'border-radius:6px;font-size:1em;z-index:1001;';
+      document.body.appendChild(t);
+      setTimeout(function() { t.remove(); loadInitialData(); }, 2000);
+    }
+
+    window.addEventListener('load', loadInitialData);
+
+    // Planifie les rechargements quotidiens à 07:00 et 12:00
+    try { scheduleDailyReload(7, 0); scheduleDailyReload(12, 0); } catch(e) { /* noop */ }
+  </script>
+
+  <!-- Footer -->
+  <div id="footer">
+    <p><strong>PRIX</strong><br>
+    ÉLÈVE: CHF 8.-&nbsp;&nbsp;&nbsp;&nbsp;ADULTE: CHF 12.-&nbsp;&nbsp;&nbsp;&nbsp;SANDWICHES: CHF 6.-
+  </div>
+
+</body>
+</html>
+
+-- Closed.html --
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <title>Caisse — Fermée</title>
+  <style>
+    html { font-size: calc(16px + (24 - 16) * ((100vw - 320px) / (1920 - 320))); }
+    body { margin:0; padding:0; font-family:sans-serif; background:#fff; color:#111; display:flex; align-items:center; justify-content:center; min-height:100vh; }
+    .box { text-align:center; max-width:800px; padding:2rem; }
+    h1 { margin:0 0 .5rem 0; font-size:2rem; }
+    p  { margin:.25rem 0; font-size:1.25rem; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h1>La caisse est désormais fermée</h1>
+    <p>La comptabilité a été transmise par e-mail.</p>
+  </div>
+</body>
+</html>
+
+-- Caisse.html --
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <title>Caisse — CAFÉTÉRIA CO FLORENCE</title>
+  <style>
+    html { font-size: calc(15px + (22 - 15) * ((100vw - 320px) / (1920 - 320))); }
+    body { margin:0; padding:0; font-family:sans-serif; background:#fff; color:#111; }
+
+    header {
+      position: sticky; top: 0; z-index: 10;
+      display:flex; align-items:center; justify-content:space-between;
+      gap:.75rem; padding:.75rem 1.25rem; background:#f7f7f7; border-bottom:1px solid #e5e5e5;
+    }
+    header h1 { margin:0; font-size: 1.35em; }
+
+    /* Buttons (smaller) */
+    .btn { border:0; border-radius:12px; padding:.5rem .75rem; cursor:pointer; font-size:.95rem; }
+    .btn.sm { padding:.35rem .6rem; font-size:.9rem; border-radius:10px; }
+    .primary { background:#007bff; color:#fff; }
+    .secondary { background:#e0e0e0; }
+    .danger { background:#dc3545; color:#fff; }
+
+    .actions { display:flex; gap:.5rem; align-items:center; flex-wrap: wrap; }
+
+    /* Totals (compact pills) */
+    .totals { display:flex; flex-wrap:wrap; gap:.4rem; padding:8px 12px; align-items:center; }
+    .pill { border:1px solid #ddd; border-radius:999px; padding:.25rem .6rem; font-size:.9rem; background:#fff; }
+    .pill.total { font-weight: 700; } /* Total cash en gras */
+
+    /* Names grid: 4 columns fixed */
+    .names-grid {
+      display:grid; grid-template-columns: repeat(4, 1fr);
+      gap:8px; padding:8px 12px;
+    }
+    .col { display:flex; flex-direction:column; gap:6px; }
+    .person { display:flex; align-items:center; justify-content:space-between; padding:6px 8px; border:1px solid #ddd; border-radius:10px; background:#fff; }
+    .name { font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:.95rem; padding-right:8px; }
+    .person.empty { visibility:hidden; }
+
+    /* Overlays / modals */
+    .overlay { position:fixed; inset:0; background:rgba(0,0,0,.45); display:none; align-items:center; justify-content:center; z-index:1000; }
+    .modal { background:#fff; border-radius:12px; width:min(92vw, 560px); padding:18px; box-shadow:0 10px 30px rgba(0,0,0,.2); }
+    .modal h3 { margin:0 0 8px 0; font-size:1.05rem; }
+    .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin:8px 0; }
+    .row label { display:flex; gap:8px; align-items:center; cursor:pointer; border:1px solid #ddd; border-radius:10px; padding:8px 10px; background:#fafafa; font-size:.95rem; }
+    .row input[type="radio"], .row input[type="checkbox"] { transform: scale(1.15); }
+    .modal-actions { display:flex; gap:10px; justify-content:flex-end; margin-top:12px; }
+    .modal input[type="text"] { width:100%; padding:10px 12px; border:1px solid #ccc; border-radius:10px; font-size:1rem; }
+
+    /* Qty (tactile simplifié) */
+    .qty-wrap { display:flex; gap:12px; align-items:center; justify-content:center; margin:12px 0; }
+    .qty-btn { width:88px; height:64px; border-radius:12px; border:1px solid #ccc; background:#f1f1f1; font-size:1.6rem; font-weight:700; cursor:pointer; user-select:none; display:flex; align-items:center; justify-content:center; }
+    .qty-display { min-width:100px; text-align:center; font-size:1.9rem; font-weight:800; border:1px solid #ddd; border-radius:12px; padding:6px 12px; background:#fff; }
+
+    /* Toast */
+    #toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.85); color: #fff; padding: 10px 14px; border-radius: 10px; font-size: .95rem; z-index: 1100; display:none; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1 id="title">Caisse</h1>
+    <div class="actions" id="actions">
+      <button id="walkinBtn" class="btn primary">+ Menu spontané</button>
+      <button id="sandBtn" class="btn secondary">+ Sandwich (CHF 6.-)</button>
+      <button id="bevBtn"  class="btn secondary">+ Boisson (CHF 2.-)</button>
+      <button id="chocBtn" class="btn secondary">+ Chocolat (CHF 1.50)</button>
+      <button id="closeBtn" class="btn danger">Fermer la caisse</button>
+    </div>
+  </header>
+
+  <section class="totals" id="totals"></section>
+  <section class="names-grid" id="names"></section>
+
+  <!-- Modal validation (menu) -->
+  <div id="overlay" class="overlay">
+    <div id="modal" class="modal">
+      <h3 id="who"></h3>
+      <div class="row" id="nameRow" style="display:none;">
+        <input type="text" id="nameInput" placeholder="Nom (facultatif)">
+      </div>
+      <div class="row" role="radiogroup" aria-label="Type d'utilisateur">
+        <label><input type="radio" name="rtype" value="ELEVE" checked> Élève (CHF 8.-)</label>
+        <label><input type="radio" name="rtype" value="PROF"> Prof (CHF 12.-)</label>
+      </div>
+      <div class="row" role="radiogroup" aria-label="Paiement">
+        <label><input type="radio" name="rpay" value="CASH" checked> Cash</label>
+        <label><input type="radio" name="rpay" value="CARD"> Carte abo (10 repas)</label>
+      </div>
+      <div class="row" aria-label="Extras">
+        <label><input type="checkbox" id="bev"> Boisson +CHF 2.-</label>
+        <label><input type="checkbox" id="choc"> Chocolat +CHF 1.50</label>
+      </div>
+      <div class="modal-actions">
+        <button class="btn sm" id="cancel">Annuler</button>
+        <button class="btn sm primary" id="ok">Valider</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal quantité (tactile simplifié) -->
+  <div id="qtyOverlay" class="overlay">
+    <div id="qtyModal" class="modal">
+      <h3 id="qtyTitle">Ajouter</h3>
+      <div class="qty-wrap">
+        <div class="qty-display" id="qtyDisplay">1</div>
+        <div class="qty-btn" id="plus1">+1</div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn sm" id="qtyCancel">Annuler</button>
+        <button class="btn sm primary" id="qtyOk">Ajouter</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal confirmation fermeture (tactile) -->
+  <div id="confirmOverlay" class="overlay">
+    <div id="confirmModal" class="modal">
+      <h3>Fermer la caisse ?</h3>
+      <p style="margin:.25rem 0 .5rem 0">Un e-mail de comptabilité va être envoyé et la caisse sera verrouillée.</p>
+      <div class="row" style="justify-content:center">
+        <button class="btn sm" id="confirmCancel">Annuler</button>
+        <button class="btn sm danger" id="confirmOk">Confirmer l'envoi</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+
+  <script>
+    var dateIso = null, currentName = null, isWalkIn = false, qty = 1, currentAddType = null;
+
+    function chf(n){ return (Math.round(n*100)/100).toFixed(2) + ' CHF'; }
+    function showToast(msg){ var t=document.getElementById('toast'); t.textContent=msg; t.style.display='block'; setTimeout(function(){ t.style.display='none'; },1400); }
+    function formatHeaderDate(iso){
+      if (!iso) return '';
+      var p = iso.split('-').map(Number), d = new Date(p[0], p[1]-1, p[2]);
+      var days = ['Dimanche','Lundi','Mardi','Mercredi','Jeudi','Vendredi','Samedi'];
+      return 'Caisse - ' + days[d.getDay()] + ' ' + String(p[2]).padStart(2,'0') + '.' + String(p[1]).padStart(2,'0');
+    }
+
+    function updateFromData(data){
+      dateIso = data.date || dateIso;
+      document.getElementById('title').textContent = formatHeaderDate(dateIso);
+
+      // Totaux (dont Total cash en gras)
+      var T = data.totals || {menus:0, eleves:0, profs:0, sandwiches:0, beverages:0, chocolates:0, amount:0};
+      var tdiv = document.getElementById('totals'); tdiv.innerHTML = '';
+
+      var items = [
+        'Menus: ' + T.menus + ' (élèves ' + (T.eleves||0) + ', profs ' + (T.profs||0) + ')',
+        'Sandwiches: ' + (T.sandwiches||0),
+        'Boissons: ' + (T.beverages||0),
+        'Chocolats: ' + (T.chocolates||0),
+        '<strong>Total cash: ' + chf(T.amount||0) + '</strong>'
+      ];
+      for (var i = 0; i < items.length; i++) {
+        var s = document.createElement('span');
+        s.className = 'pill' + (i === items.length - 1 ? ' total' : '');
+        if (i === items.length - 1) s.innerHTML = items[i]; else s.textContent = items[i];
+        tdiv.appendChild(s);
+      }
+
+      // Noms en 4 colonnes fixes de 10 (ordre conservé par le serveur)
+      var list = (data.names || []).slice(0, 40);
+      var box = document.getElementById('names'); box.innerHTML = '';
+      for (var col=0; col<4; col++){
+        var colDiv = document.createElement('div'); colDiv.className = 'col';
+        var slice = list.slice(col*10, col*10 + 10);
+        for (var i=0; i<10; i++){
+          var name = slice[i];
+          var row = document.createElement('div'); row.className = 'person' + (name ? '' : ' empty');
+          if (name) {
+            var left = document.createElement('div'); left.className = 'name'; left.textContent = name;
+            var btn  = document.createElement('button'); btn.className = 'btn sm primary'; btn.textContent = 'Valider';
+            btn.onclick = (function(nm){ return function(){ openModal(nm); }; })(name);
+            row.appendChild(left); row.appendChild(btn);
+          } else {
+            row.textContent = '—';
+          }
+          colDiv.appendChild(row);
+        }
+        box.appendChild(colDiv);
+      }
+    }
+
+    function refresh(){
+      google.script.run
+        .withSuccessHandler(updateFromData)
+        .withFailureHandler(function(err){ alert('Erreur chargement: ' + err); })
+        .getCaisseData(dateIso);
+    }
+
+    // ----- Modal validation -----
+    function openModal(name){
+      isWalkIn = false;
+      currentName = name;
+      document.getElementById('who').textContent = name;
+      document.getElementById('nameRow').style.display = 'none';
+      document.getElementById('nameInput').value = '';
+      document.getElementById('bev').checked = false;
+      document.getElementById('choc').checked = false;
+      document.querySelector('input[name="rtype"][value="ELEVE"]').checked = true;
+      document.querySelector('input[name="rpay"][value="CASH"]').checked  = true;
+      document.getElementById('overlay').style.display = 'flex';
+    }
+
+    function openWalkIn(){
+      isWalkIn = true;
+      currentName = null;
+      document.getElementById('who').textContent = 'Menu spontané';
+      document.getElementById('nameRow').style.display = 'flex';
+      document.getElementById('nameInput').value = '';
+      document.getElementById('bev').checked = false;
+      document.getElementById('choc').checked = false;
+      document.querySelector('input[name="rtype"][value="ELEVE"]').checked = true;
+      document.querySelector('input[name="rpay"][value="CASH"]').checked  = true;
+      document.getElementById('overlay').style.display = 'flex';
+    }
+
+    function closeModal(){ document.getElementById('overlay').style.display = 'none'; }
+    document.getElementById('cancel').onclick = closeModal;
+
+    document.getElementById('ok').onclick = function(){
+      var t    = document.querySelector('input[name="rtype"]:checked').value;
+      var pay  = document.querySelector('input[name="rpay"]:checked').value; // CASH | CARD
+      var bev  = document.getElementById('bev').checked;
+      var choc = document.getElementById('choc').checked;
+
+      var name = isWalkIn ? (document.getElementById('nameInput').value.trim() || 'Anonyme') : currentName;
+
+      google.script.run
+        .withSuccessHandler(function(data){
+          closeModal();
+          showToast('Validé ✔');
+          updateFromData(data);
+        })
+        .withFailureHandler(function(err){
+          alert(err);
+          refresh();
+        })
+        .checkout(name, t, bev, choc, dateIso, pay);
+    };
+
+    // ----- Modal quantité simplifié -----
+    function openQtyModal(kind){
+      currentAddType = kind; qty = 1;
+      document.getElementById('qtyDisplay').textContent = qty;
+      document.getElementById('qtyTitle').textContent =
+        kind==='sand' ? 'Ajouter des Sandwiches' : kind==='bev' ? 'Ajouter des Boissons' : 'Ajouter des Chocolats';
+      document.getElementById('qtyOverlay').style.display = 'flex';
+    }
+    function closeQtyModal(){ document.getElementById('qtyOverlay').style.display = 'none'; }
+    document.getElementById('plus1').onclick = function(){ qty = Math.min(999, qty+1); document.getElementById('qtyDisplay').textContent = qty; };
+    document.getElementById('qtyCancel').onclick = closeQtyModal;
+    document.getElementById('qtyOk').onclick = function(){
+      var f = currentAddType==='sand' ? 'addSandwich' : currentAddType==='bev' ? 'addBeverage' : 'addChocolate';
+      var txt = currentAddType==='sand' ? '+ Sandwich' : currentAddType==='bev' ? '+ Boisson' : '+ Chocolat';
+      google.script.run
+        .withSuccessHandler(function(data){ closeQtyModal(); showToast(txt); updateFromData(data); })
+        .withFailureHandler(function(err){ alert(err); closeQtyModal(); refresh(); })
+        [f](qty, dateIso);
+    };
+
+    // ----- Confirmation fermeture tactile -> redirection page Closed (via code.gs) -----
+    function openConfirm(){ document.getElementById('confirmOverlay').style.display = 'flex'; }
+    function closeConfirm(){ document.getElementById('confirmOverlay').style.display = 'none'; }
+    document.getElementById('confirmCancel').onclick = closeConfirm;
+    document.getElementById('confirmOk').onclick = function(){
+      google.script.run
+        .withSuccessHandler(function(resp){
+          closeConfirm();
+          var url = (resp && resp.closedUrl) ? resp.closedUrl : (location.pathname + '?page=closed');
+          window.location.replace(url);
+        })
+        .withFailureHandler(function(err){ alert('Erreur fermeture: ' + err); closeConfirm(); })
+        .closeCaisse(dateIso);
+    };
+
+    // ----- Header buttons -----
+    document.getElementById('walkinBtn').onclick = openWalkIn;
+    document.getElementById('sandBtn').onclick  = function(){ openQtyModal('sand'); };
+    document.getElementById('bevBtn').onclick   = function(){ openQtyModal('bev');  };
+    document.getElementById('chocBtn').onclick  = function(){ openQtyModal('choc'); };
+    document.getElementById('closeBtn').onclick = openConfirm;
+
+    // Boot
+    window.addEventListener('load', function(){
+      if (google && google.script && google.script.url) {
+        google.script.url.getLocation(function(loc){ dateIso = (loc.parameter && loc.parameter.date) || null; refresh(); });
+      } else { refresh(); }
+    });
+  </script>
+</body>
+</html>
+
+
