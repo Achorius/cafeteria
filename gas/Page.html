@@ -1,0 +1,384 @@
+<!-- Page.html -->
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+  <title>CAFÉTÉRIA CO FLORENCE</title>
+  <style>
+    html {
+      font-size: calc(16px + (24 - 16) * ((100vw - 320px) / (1920 - 320)));
+    }
+    body {
+      margin: 0; padding: 0;
+      font-family: sans-serif;
+      text-align: center;
+    }
+    h1 {
+      font-size: 4em;
+      color: red;
+      margin: 1.5em 0 0.15em;
+    }
+    h2 {
+      font-size: 2em;
+      margin: 1em 0 0.5em;
+    }
+
+    /* Day blocks */
+    .jour {
+      display: inline-block; vertical-align: top;
+      width: 15vw; margin: 1vw; padding: 1.5vw;
+      border: 0.2vw solid #ccc; border-radius: 1vw;
+      cursor: pointer; transition: opacity .3s;
+      font-size: 1.1em; color: inherit;
+    }
+    .jour.closed { opacity: .4; cursor: not-allowed; }
+    .jour.disabled {
+      border-color: red; color: red;
+    }
+    .jour.disabled strong,
+    .jour.disabled .date,
+    .jour.disabled .menu {
+      color: red;
+    }
+    .jour strong {
+      display: block; font-size: 1.4em; margin-bottom: .5vw;
+    }
+    .jour .date {
+      display: block; font-weight: bold; margin-bottom: 1vw;
+    }
+    .menu {
+      white-space: pre-line; margin-top: 1vw; font-size: 1em;
+    }
+
+    /* Action buttons */
+    .top-actions {
+      margin: 2vw 0;
+      display: flex; justify-content: center; gap: 2vw;
+    }
+    .top-actions button {
+      padding: 1vw 2vw; font-size: 1.2em; font-weight: bold;
+      background: #007bff; color: #fff; border: none;
+      border-radius: 1vw; cursor: pointer;
+    }
+    .top-actions button:hover {
+      background: #0056b3;
+    }
+
+    /* Participants grid */
+    .participants-container {
+      display: flex; justify-content: center; gap: 1vw;
+      margin: 2vw auto; max-width: 80vw;
+    }
+    .participants-column {
+      flex: 1; display: flex; flex-direction: column; gap: .25vw;
+    }
+    .participant {
+      padding: .3vw 1vw; font-size: .7em;
+      border: .1vw solid #ccc; border-radius: 1vw;
+      cursor: pointer; text-align: center;
+    }
+
+    /* Modal overlay */
+    #modalOverlay {
+      position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0,0,0,0.5);
+      display: none; align-items: center; justify-content: center;
+      z-index: 1000;
+    }
+    /* Modal box adapts to content width */
+    #modalBox {
+      display: inline-block;
+      background: #fff; padding: 2vw;
+      border-radius: 1vw;
+      box-shadow: 0 .5vw 2vw rgba(0,0,0,0.3);
+      max-width: 95vw; max-height: 95vh;
+      overflow: auto; text-align: center;
+      box-sizing: border-box;
+    }
+    #modalBox input {
+      width: 100%; padding: 1vw; font-size: 1em;
+      margin-bottom: 1vw; box-sizing: border-box;
+    }
+    /* Virtual keyboard */
+    #virtualKeyboard {
+      display: flex; flex-direction: column; gap: 1vw;
+      margin-bottom: 1vw;
+    }
+    #virtualKeyboard .row {
+      display: flex; justify-content: center; gap: 1vw;
+    }
+    #virtualKeyboard .key {
+      flex: 1; min-width: 8vw; padding: 2vw 0;
+      background: #e0e0e0; border-radius: 1vw;
+      text-align: center; font-size: 1.5em;
+      cursor: pointer; user-select: none;
+    }
+    #virtualKeyboard .key.wide {
+      flex: 4;
+    }
+    #virtualKeyboard .key:active {
+      background: #ccc;
+    }
+    /* Buttons under keyboard */
+    #modalBox .buttons {
+      display: flex; justify-content: flex-end; gap: 1vw;
+    }
+    #modalBox .buttons button {
+      padding: 1vw 2vw; font-size: 1em;
+      border: none; border-radius: .5vw;
+      background: #007bff; color: #fff;
+      cursor: pointer;
+    }
+    #modalBox .buttons button:hover {
+      background: #0056b3;
+    }
+    #footer {
+      position: fixed;
+      bottom: 0.5vw;
+      left: 0;
+      width: 100%;
+      text-align: center;
+      font-size: 1em;
+      color: red;
+      padding: 0.2vw 0;
+      background: rgba(255,255,255,0.8);
+    }
+  </style>
+</head>
+<body>
+  <h1>CAFÉTÉRIA CO FLORENCE</h1>
+  <div id="jours"></div>
+  <div id="list" style="display:none;"></div>
+  <div id="modalOverlay"><div id="modalBox"></div></div>
+
+  <script>
+    var availableDays = [], reservationsMap = {};
+
+    // Auto-refresh à 07:00 et 12:00 (heure locale)
+    function scheduleDailyReload(hour, minute) {
+      function msUntilNext(h, m) {
+        var now = new Date();
+        var target = new Date(now.getFullYear(), now.getMonth(), now.getDate(), h, m, 0, 0);
+        if (target <= now) target.setDate(target.getDate() + 1);
+        return target - now;
+      }
+      function plan() {
+        var delay = msUntilNext(hour, minute);
+        setTimeout(function() {
+          // Recharge "forte" en ajoutant un paramètre anti-cache
+          var base = location.href.split('#')[0].split('?')[0];
+          location.replace(base + '?_r=' + Date.now());
+        }, delay);
+      }
+      plan();
+    }
+
+    function loadInitialData() {
+      google.script.run
+        .withSuccessHandler(function(data) {
+          availableDays   = data.days;
+          reservationsMap = data.reservations;
+          renderHome();
+        })
+        .getInitialData();
+    }
+
+    function renderHome() {
+      var joursDiv = document.getElementById('jours'),
+          listDiv  = document.getElementById('list');
+      listDiv.style.display = 'none';
+      joursDiv.style.display = 'block';
+      joursDiv.innerHTML = '';
+
+      availableDays.forEach(function(d) {
+        var div = document.createElement('div'),
+            cls = ['jour'];
+        if (!d.open)      cls.push('closed');
+        if (d.disabled)   cls.push('disabled');
+        div.className = cls.join(' ');
+        div.innerHTML =
+          '<strong>' + d.jour + '</strong>' +
+          '<span class="date">' + d.date + '</span>' +
+          '<div class="menu">' + d.menu + '</div>';
+        if (d.open && !d.disabled) {
+          div.onclick = function() { showList(d.date); };
+        }
+        joursDiv.appendChild(div);
+      });
+    }
+
+    function showList(date) {
+      var joursDiv = document.getElementById('jours'),
+          listDiv  = document.getElementById('list');
+      joursDiv.style.display = 'none';
+      listDiv.style.display  = 'block';
+      listDiv.innerHTML      = '';
+
+      var dayObj = availableDays.find(function(d){ return d.date === date; });
+
+      var h2 = document.createElement('h2');
+      h2.textContent = 'Inscriptions pour ' +
+        (dayObj ? dayObj.jour + ' ' : '') + date;
+      listDiv.appendChild(h2);
+
+      if (dayObj) {
+        var menuDiv = document.createElement('div');
+        menuDiv.className = 'menu';
+        menuDiv.textContent = dayObj.menu;
+        listDiv.appendChild(menuDiv);
+      }
+
+      var list = reservationsMap[date] || [];
+      var actions = document.createElement('div');
+      actions.className = 'top-actions';
+
+      var backBtn = document.createElement('button');
+      backBtn.textContent = '← Retour';
+      backBtn.onclick = renderHome;
+      actions.appendChild(backBtn);
+
+      // Only show "S'inscrire" if fewer than 40 reservations
+      if (list.length < 40) {
+        var inscBtn = document.createElement('button');
+        inscBtn.textContent = "S'inscrire";
+        inscBtn.onclick = function() { openRegisterModal(date); };
+        actions.appendChild(inscBtn);
+      }
+
+      listDiv.appendChild(actions);
+
+      var container = document.createElement('div');
+      container.className = 'participants-container';
+      for (var col = 0; col < 4; col++) {
+        var colDiv = document.createElement('div');
+        colDiv.className = 'participants-column';
+        var slice = list.slice(col * 10, col * 10 + 10);
+        if (!slice.length) {
+          var empty = document.createElement('div');
+          empty.style.visibility = 'hidden';
+          empty.textContent = '—';
+          colDiv.appendChild(empty);
+        }
+        slice.forEach(function(name) {
+          var p = document.createElement('div');
+          p.className = 'participant';
+          p.textContent = name;
+          p.onclick = function() { openUnregisterModal(name, date); };
+          colDiv.appendChild(p);
+        });
+        container.appendChild(colDiv);
+      }
+      listDiv.appendChild(container);
+    }
+
+    function openRegisterModal(date) {
+      showModal(
+        '<input id="regName" placeholder="Votre nom" readonly>' +
+        '<div id="virtualKeyboard"></div>' +
+        '<div class="buttons">' +
+          '<button id="regCancel">Annuler</button>' +
+          '<button id="regOk">Valider</button>' +
+        '</div>',
+        function() {
+          initKeyboard('regName');
+          document.getElementById('regCancel').onclick = closeModal;
+          document.getElementById('regOk').onclick = function() {
+            var name = document.getElementById('regName').value.trim();
+            if (!name) return;
+            google.script.run.withSuccessHandler(function(msg) {
+              showTemp(msg);
+            }).reserve(name, date);
+            closeModal();
+          };
+        }
+      );
+    }
+
+    function initKeyboard(inputId) {
+      var layout = [
+        ['1','2','3','4','5','6','7','8','9','0'],
+        ['Q','W','E','R','T','Z','U','I','O','P'],
+        ['A','S','D','F','G','H','J','K','L','M'],
+        ['Y','X','C','V','B','N','-',"'",'.'],
+        ['Space','Backspace']
+      ];
+      var kb = document.getElementById('virtualKeyboard');
+      kb.innerHTML = '';
+      layout.forEach(function(row) {
+        var rowDiv = document.createElement('div');
+        rowDiv.className = 'row';
+        row.forEach(function(k) {
+          var key = document.createElement('div');
+          key.className = 'key' + (k === 'Space' ? ' wide' : '');
+          key.textContent = k === 'Space' ? '⎵' : k;
+          key.onclick = function() {
+            var inp = document.getElementById(inputId);
+            if (k === 'Backspace') inp.value = inp.value.slice(0, -1);
+            else if (k === 'Space') inp.value += ' ';
+            else inp.value += k;
+          };
+          rowDiv.appendChild(key);
+        });
+        kb.appendChild(rowDiv);
+      });
+    }
+
+    function openUnregisterModal(name, date) {
+      showModal(
+        '<h3>Désinscrire ' + name + '</h3>' +
+        '<p>Le ' + date + ' ?</p>' +
+        '<div class="buttons">' +
+          '<button id="unregCancel">Annuler</button>' +
+          '<button id="unregOk">Confirmer</button>' +
+        '</div>',
+        function() {
+          document.getElementById('unregCancel').onclick = closeModal;
+          document.getElementById('unregOk').onclick = function() {
+            google.script.run.withSuccessHandler(function(msg) {
+              showTemp(msg);
+            }).unreserve(name, date);
+            closeModal();
+          };
+        }
+      );
+    }
+
+    function showModal(html, bindFn) {
+      var ov = document.getElementById('modalOverlay'),
+          box = document.getElementById('modalBox');
+      box.innerHTML = html;
+      ov.style.display = 'flex';
+      bindFn();
+    }
+    function closeModal() {
+      document.getElementById('modalOverlay').style.display = 'none';
+    }
+    function showTemp(msg) {
+      var t = document.createElement('div');
+      t.textContent = msg;
+      t.style.cssText =
+        'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);' +
+        'background:rgba(0,0,0,0.8);color:#fff;padding:12px 24px;' +
+        'border-radius:6px;font-size:1em;z-index:1001;';
+      document.body.appendChild(t);
+      setTimeout(function() { t.remove(); loadInitialData(); }, 2000);
+    }
+
+    window.addEventListener('load', loadInitialData);
+
+    // Planifie les rechargements quotidiens à 07:00 et 12:00
+    try { scheduleDailyReload(7, 0); scheduleDailyReload(12, 0); } catch(e) { /* noop */ }
+  </script>
+
+  <!-- Footer -->
+  <div id="footer">
+    <p><strong>PRIX</strong><br>
+    ÉLÈVE: CHF 8.-&nbsp;&nbsp;&nbsp;&nbsp;ADULTE: CHF 12.-&nbsp;&nbsp;&nbsp;&nbsp;SANDWICHES: CHF 6.-
+  </div>
+
+</body>
+</html>
